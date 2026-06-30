@@ -1,20 +1,21 @@
-# Authorization Component Requirements
+# OAuth Token Processing Requirements
 
-## Overview
-Design and implement a reusable RBAC (Role-Based Access Control) authorization component that centralizes permission evaluation for both UI and API consumers. The component should be easy to integrate, configurable, and compliant with company security and accessibility expectations.
+## Business Goal
+Enable the authentication service to accept and process OAuth tokens issued by an external authorization system so downstream services can rely on a standardized identity assertion without requiring users to re-enter credentials.
 
 ## Functional Requirements
-1. The component must evaluate a user’s current roles and permissions to allow or deny access to requested operations or UI elements.
-2. The component must expose a client-friendly API for requesting whether a user is authorized to perform a specific action within a given scope (e.g., `canPerform(action, resource)`).
-3. The component must support declaratively defining roles, permissions, and resources in configuration so policies can be maintained without code changes.
-4. The component must provide both programmatic hooks (for backend services) and UI helpers (for enabling/disabling controls) to centralize authorization logic.
+1. **Token Intake Endpoint**: Provide a secure endpoint where clients submit OAuth tokens. The endpoint must accept only `POST` requests containing a bearer token following the existing API contract.
+2. **Token Validation**: Validate the provided OAuth token with the configured external authorization provider (e.g., introspect or verify token signature) before granting access.
+3. **User Profile Resolution**: Map validated tokens to internal user profiles, creating or refreshing local records when necessary without exposing sensitive data to the caller.
+4. **Session Issuance**: Upon successful validation, issue or update the session data (JWT or equivalent) used by downstream services, ensuring consistent identity information.
+5. **Error Handling**: Return standard, non-enumerating errors (`401 "invalid email or password"` or a generic `403`) when validation fails, regardless of whether the token corresponds to an existing user [S2].
+6. **Audit Logging**: Log validation attempts and outcomes (without logging secrets) to help debug and monitor the OAuth bridge.
 
-## Non-functional Requirements
-- **Security:** All modifications that change stored authorization rules, role assignments, or call an external service of record must pass a human-in-the-loop review gate per P-2 guidance before writing to the system [S1].
-- **Validation:** Inputs to the authorization API must be schema-validated; invalid requests must respond with clear, machine-readable error objects.
-- **Accessibility:** Any UI surfaces (e.g., labeled toggles showing authorization status) must include accessible labels, support keyboard navigation, and ensure screen-reader friendly error annunciation [S2].
-- **Data Integrity:** Changes should be audit-ready with logging enabling traceability for permission evaluations and configuration changes.
+## Non-Functional Requirements
+- **Security**: Secrets (client IDs, secrets, API tokens) must be sourced from environment variables or a dedicated secret store and must never be hardcoded, committed, or returned to clients [S1].
+- **Dependency Management**: Introduce new dependencies only when essential; prefer the standard library or already-present frameworks, and pin new packages to sensible minimum versions [S3].
+- **Validation**: Enforce strict schema validation on incoming payloads to prevent malformed requests from reaching the token validator.
+- **Accessibility**: Document the OAuth endpoint clearly in the API reference so integrators understand the contract, HTTP verbs, headers, and payloads.
 
-## Operational Expectations
-- Provide automated and manual test coverage verifying the RBAC rules, including unit tests for policy evaluation and integration tests for UI guard rails.
-- Include documentation for developers describing how to register new roles and reference the authorization component in both services and UI pages.
+## Traceable Stories
+Refer to `stories.json` for implementation stories, acceptance criteria, and subtasks.

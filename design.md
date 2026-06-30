@@ -1,107 +1,76 @@
-# RBAC Authorization Component Design
+# OAuth-Enabled Auth Service Design
 
 ## Overview
-The RBAC authorization service provides role- and permission-based access control for downstream services, exposes a secure API for role checks and policy administration, and follows the human-in-the-loop review gate before writing to any system of record [S1]. Error responses and any admin UI pieces must include labelled fields and screen-reader announcements to remain accessible [S2].
+Implement an OAuth token processing service using Go and the standard `net/http` stack plus minimal, vetted dependencies (e.g., `github.com/google/uuid` or `golang.org/x/oauth2` only if truly necessary) to stay aligned with [S3]. Go suits the service due to its efficient concurrency, static binary, and strong standard library support for networking and crypto. The service will accept OAuth tokens from trusted external providers, validate them, fetch user metadata, and issue our internal session tokens or user context.
 
-### Implementation Platform
-- **Language & Framework:** Go with the Echo web framework for fast, strongly typed APIs and middleware support that suit the RBAC guardrail requirements.
+## Architecture
+- **API gateway**: Exposes REST endpoints, validates incoming request structure, enforces authorization, and handles error translation to keep responses compliant with [S2].
+- **OAuth verifier**: Validates incoming bearer tokens by calling the OAuth provider’s introspection/userinfo endpoint, caching JWKS, and ensuring tokens are not expired or revoked.
+- **User sync**: Reconciles the verified OAuth identity with our internal user model, creating or updating users as needed.
+- **Session manager**: Issues internal JWTs or session tokens from secrets kept strictly in environment variables per [S1].
 
 ## Component Breakdown
-1. **API Layer (cmd/rbac-service)**
-   - HTTP entry point with Echo, routing requests to use cases.
-   - Middleware for authentication token parsing and context enrichment.
-2. **Authorization Service (internal/authorization)**
-   - Evaluates roles, permissions, and context data to allow/deny actions.
-   - Loads policies from `pkg/policystore` cache and refreshes with watch support.
-3. **Policy Store (pkg/policystore)**
-   - Reads from persistent backing (mocked in-memory for tests) and provides query methods.
-   - Emits events when policies change; allows gating before writes.
-4. **Audit & Metrics (internal/audit)**
-   - Records decisions for observability. Ensures any write attempts go through human review flow before applying [S1].
-5. **Tests (tests/authorization)**
-   - Unit tests for policy logic, middleware, and edge cases; integration tests verify REST flows.
+1. **cmd/server/main.go** – Entry point that initializes config, logger, OAuth client, and HTTP server.
+2. **internal/config/config.go** – Loads configuration from environment variables (OAuth provider URL, client ID/secret, JWT signing key, cache settings) with no embedded secrets [S1].
+3. **internal/server/server.go** – Sets up router (using Go `http.ServeMux` or minimal router) with middleware for logging, metrics, and error handling.
+4. **internal/handlers/oauth.go** – Handles `/oauth/verify` (POST) and `/oauth/refresh` endpoints, managing payload validation and response formatting.
+5. **internal/oauth/verifier.go** – Encapsulates OAuth provider interactions: token introspection/userinfo calls, JWK fetching, signature verification, caching.
+6. **internal/session/session.go** – Generates signed JWTs for our ecosystem with configurable algorithm and expiration pulled from env vars.
+7. **internal/errors/errors.go** – Centralized error types ensuring authentication failures return the generic `401 "invalid email or password"` message no matter the root cause [S2].
+8. **internal/log/log.go** – Provides structured logging wrapper.
+9. **tests/** – Unit tests for handlers/verifier/session ensuring correct logic and security.
 
 ## API Contract
-### 1. `POST /v1/authorize`
-- Purpose: Evaluate whether a subject can perform an action on a resource.
-- Request:
-  ```json
-  {
-    "subjectId": "user-123",
-    "roles": ["editor"],
-    "action": "article:update",
-    "resource": "article:456"
-  }
-  ```
-- Response 200:
-  ```json
-  {
-    "allowed": true,
-    "policiesEvaluated": ["editor-can-edit"],
-    "message": "Access granted"
-  }
-  ```
-- Response 403:
-  ```json
-  {
-    "allowed": false,
-    "reason": "Missing permission article:update",
-    "message": "Access denied"
-  }
-  ```
-- Accessibility note: client should announce `message` for screen readers [S2].
+| Endpoint | Method | Request | Response | Notes |
+| --- | --- | --- | --- | --- |
+| `/oauth/verify` | POST | `{ "token": "<bearer token>" }` | `200 { "user_id": "<uuid>", "roles": [...], "session_token": "<jwt>" }` | Rejects malformed requests early; uses generic 401 for invalid credentials [S2]. |
+| `/oauth/refresh` | POST | `{ "refresh_token": "..." }` | `200 { "session_token": "<jwt>" }` | Optional refresh; depends on session management policy. |
 
-### 2. `GET /v1/policies`
-- Lists all policies (paged). No real system of record writes.
-
-### 3. `POST /v1/policies`
-- Creates or updates a policy; requires review gate before persistence. Payload must include `review_id` referencing a human review token [S1].
-
-### 4. `POST /v1/roles/{roleId}/permissions`
-- Assign permissions to roles within RBAC store; writes gated by reviewing workflow [S1].
+All secret configuration (OAuth client secret, JWT signing key) is provided via environment variables and never leaked back to clients [S1].
 
 ## Sequence Diagram
 ```mermaid
 sequenceDiagram
     participant Client
-    participant API as Echo API
-    participant AuthSvc as Authorization Service
-    participant Policy as Policy Store
-    Client->>API: POST /v1/authorize
-    API->>AuthSvc: evaluate(request)
-    AuthSvc->>Policy: fetchPolicies(subjectId, roles)
-    Policy-->>AuthSvc: policies
-    AuthSvc-->>API: decision
-    API-->>Client: {allowed:true}
+    participant API
+    participant OAuthProvider
+
+    Client->>API: POST /oauth/verify { token }
+    API->>OAuthProvider: Validate token/introspect
+    OAuthProvider-->>API: Token details
+    API->>API: Map to internal user; issue JWT
+    API-->>Client: 200 + session_token
 ```
 
 ## Project structure
 ```
-rbac-service/
+auth-service/
 ├── cmd/
-│   └── rbac-service/
-│       └── main.go              # Echo bootstrap, middleware, route registration
+│   └── server/
+│       └── main.go
 ├── internal/
-│   ├── authorization/
-│   │   ├── service.go           # Core evaluation logic
-│   │   └── service_test.go      # Unit tests for service logic
-│   ├── middleware/
-│   │   └── auth.go              # Authentication, context decorator
-│   └── audit/
-│       └── recorder.go          # Writes audit entries (gated)
-├── pkg/
-│   └── policystore/
-│       ├── store.go             # Policy persistence abstraction
-│       └── store_mock.go        # In-memory implementation for tests
-├── api/
-│   └── openapi.yaml             # API contract reference
-├── config/
-│   └── config.yaml              # Service configuration (ports, policy refresh intervals)
+│   ├── config/
+│   │   └── config.go
+│   ├── errors/
+│   │   └── errors.go
+│   ├── handlers/
+│   │   └── oauth.go
+│   ├── log/
+│   │   └── log.go
+│   ├── oauth/
+│   │   └── verifier.go
+│   ├── server/
+│   │   └── server.go
+│   └── session/
+│       └── session.go
 ├── tests/
-│   └── integration/
-│       └── authorize_flow_test.go# End-to-end authorization API tests
-├── go.mod                        # Go module file
-├── go.sum                        # Dependency checksums
-├── README.md                     # Implementation guidance and running instructions
-└── design.md                     # This document
+│   ├── handlers/
+│   │   └── oauth_test.go
+│   ├── oauth/
+│   │   └── verifier_test.go
+│   └── session/
+│       └── session_test.go
+├── go.mod
+├── go.sum
+└── README.md
 ```
